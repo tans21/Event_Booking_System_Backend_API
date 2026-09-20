@@ -1,6 +1,6 @@
 # Event Booking System — Backend API
 
-A role-based REST API where **Event Organizers** manage events and **Customers** browse events and book tickets. Built with FastAPI, PostgreSQL, and JWT auth. Two background tasks simulate email notifications (booking confirmation and event-update notification) via console logs.
+A role-based REST API where **Event Organizers** manage events and **Customers** browse events and book tickets. Built with FastAPI, PostgreSQL, and JWT auth. Two background tasks send **real emails** (booking confirmation and event-update notification) via **Gmail SMTP**.
 
 ---
 
@@ -19,7 +19,7 @@ Two asynchronous background tasks run after the HTTP response is sent:
 1. **Booking Confirmation** — triggered when a customer books tickets.
 2. **Event Update Notification** — triggered when an organizer updates an event; notifies every customer holding a confirmed booking for that event.
 
-Both currently log a single line to the console (as specified) instead of sending real email.
+Both send a **real HTML email** through Gmail SMTP (async, via `aiosmtplib`).
 
 ---
 
@@ -33,6 +33,7 @@ Both currently log a single line to the console (as specified) instead of sendin
 | **Alembic** | Versioned, reviewable schema migrations kept under source control. |
 | **JWT (`python-jose`) + `bcrypt`** | Stateless auth. The role is embedded in the token, so authorization needs no session store. Passwords are hashed with bcrypt. |
 | **FastAPI `BackgroundTasks`** | In-process async tasks that run after the response. No Redis/Celery broker needed for this scope. |
+| **Gmail SMTP + `aiosmtplib`** | Sends real email over an async SMTP client. No domain or paid provider needed — an App Password lets it deliver to *any* recipient's inbox (~500/day). |
 
 > **Password hashing note:** we call `bcrypt` directly rather than through `passlib`, because `passlib` 1.7.4 is incompatible with `bcrypt` 5.x on recent Python versions. bcrypt only considers the first 72 bytes of a password, which we handle explicitly in [app/services/auth_service.py](app/services/auth_service.py).
 
@@ -106,21 +107,42 @@ Both live in [app/tasks/notifications.py](app/tasks/notifications.py) and are sc
 
 ### Task 1 — Booking Confirmation
 - **Trigger:** `POST /api/v1/bookings`, after the booking is committed ([app/routers/customer.py](app/routers/customer.py)).
-- **Output (one line):**
+- **Behavior:** sends a real HTML confirmation email (booking id, ticket count, total) to the customer via Gmail SMTP, then logs the send:
   ```
-  [EMAIL] Confirmation sent to cust@example.com for "Tech Summit 2026" — 2 ticket(s), $1998.00 (Booking #1)
+  [EMAIL] Booking confirmation sent to cust@example.com — Booking #1
   ```
 
 ### Task 2 — Event Update Notification
 - **Trigger:** `PUT /api/v1/organizer/events/{id}`, after the update is committed ([app/routers/organizer.py](app/routers/organizer.py)). Only fires if at least one field actually changed.
-- **Behavior:** queries every customer with a `confirmed` booking for that event and logs one line each:
+- **Behavior:** queries every customer with a `confirmed` booking for that event and sends each of them a real HTML email naming the changed fields:
   ```
-  [EMAIL] Event update notification sent to cust@example.com — "Tech Summit 2026" updated: venue
+  [EMAIL] Update notification sent to cust@example.com — "Tech Summit 2026" changed: venue
   ```
+
+### Email configuration
+
+Set these in `.env` (see [.env.example](.env.example)). Requires 2-Step Verification on the
+Google account plus an [App Password](https://myaccount.google.com/apppasswords):
+
+| Var | Purpose |
+|---|---|
+| `SMTP_HOST` / `SMTP_PORT` | `smtp.gmail.com` / `587` (STARTTLS). |
+| `SMTP_USER` | Your Gmail address. |
+| `SMTP_PASSWORD` | Gmail **App Password** (16 chars) — not your normal password. |
+| `EMAIL_FROM` | Sender address (must be the Gmail address). |
+| `EMAIL_TO_OVERRIDE` | Optional: redirect *all* mail to one inbox (handy for demos). Leave empty to email each real recipient. |
 
 ### Design decisions
 
 - **Why FastAPI `BackgroundTasks` and not Celery/Redis:** the tasks are short, in-process, and don't need retries or a separate worker fleet for this scope. No extra infrastructure to run.
+
+- **Why Gmail SMTP over a hosted email API:** it needs no domain verification and no paid plan — an App Password can deliver to *any* recipient immediately, so an evaluator who books with their own email actually receives it. (A hosted provider's free tier only delivers to the account owner until a domain is verified.)
+
+- **Why `aiosmtplib` (async) not `smtplib`:** the tasks run on the event loop, so an async SMTP client avoids blocking it during the network round-trip.
+
+- **Why sends are wrapped in try/except:** an email failure must never crash the request flow — the booking/update is already committed by the time the task runs, so a send error is logged, not raised.
+
+- **Why a single `_send_email` helper:** both tasks share it, and tests mock this one function to stay offline (no real mail during `pytest`).
 
 - **Why Task 2 receives a session *factory*, not the request's DB session:** FastAPI closes the request-scoped `AsyncSession` as soon as the response is sent — before the background task runs. Reusing it would raise an error. The task instead receives `AsyncSessionLocal` and opens its own short-lived session (`async with session_factory() as db:`).
 
@@ -219,7 +241,30 @@ Open **http://localhost:8000/docs** for Swagger UI. Click **Authorize**, paste t
 
 ---
 
-## 8. Testing the System
+## 8. Deployment (Render)
+
+The app ships with a [render.yaml](render.yaml) blueprint that provisions a **web service**
+plus a **free PostgreSQL** database in one step.
+
+### Deploy steps
+1. Push the repo to GitHub.
+2. In the [Render dashboard](https://dashboard.render.com): **New → Blueprint**, select the repo. Render reads `render.yaml` and creates both the database and the web service.
+3. When prompted, fill in the **secret** env vars (marked `sync: false`, never committed):
+   `SMTP_USER`, `SMTP_PASSWORD` (Gmail App Password), `EMAIL_FROM`, and `EMAIL_TO_OVERRIDE` (leave blank to email real recipients).
+4. Click **Apply**. On deploy, the start command runs `alembic upgrade head` before launching Uvicorn, so the schema is migrated automatically.
+
+Once live, Swagger is at `https://<your-service>.onrender.com/docs`.
+
+### Deployment design decisions
+- **`DATABASE_URL` auto-normalization** ([app/config.py](app/config.py)): Render injects a `postgresql://` URL, but the async stack needs `postgresql+asyncpg://`. A field validator rewrites the scheme so the same code runs locally and in the cloud with no manual edits.
+- **`SECRET_KEY` via `generateValue: true`**: Render generates a strong secret at provision time — no secret is hard-coded or committed.
+- **Migrations in the start command**, not the build command: the database is reachable at runtime (not always during build), and this guarantees the schema is current on every deploy.
+- **`healthCheckPath: /health`**: Render uses the existing health endpoint to gate traffic to healthy instances.
+- **Free-tier caveat:** the free web service spins down after ~15 min idle and cold-starts (~50 s) on the next request — relevant when interpreting the first request of a load test (warm it up first).
+
+---
+
+## 9. Testing the System
 
 Manual end-to-end flow (via Swagger or curl):
 
@@ -228,9 +273,9 @@ Manual end-to-end flow (via Swagger or curl):
 3. Log both in → `POST /auth/login`, copy each `access_token`.
 4. As organizer, create an event → `POST /organizer/events`.
 5. As customer, browse → `GET /events` (confirm the event appears).
-6. As customer, book tickets → `POST /bookings`. **Watch the server console for the `[EMAIL] Confirmation sent...` line (Task 1).**
+6. As customer, book tickets → `POST /bookings`. **Check your inbox for the booking-confirmation email, and the server console for the `[EMAIL] Booking confirmation sent...` line (Task 1).**
 7. As customer, view bookings → `GET /bookings`, and check inventory dropped via `GET /events/{id}`.
-8. As organizer, update the event → `PUT /organizer/events/{id}`. **Watch the console for `[EMAIL] Event update notification...` (Task 2).**
+8. As organizer, update the event → `PUT /organizer/events/{id}`. **Check your inbox for the update email, and the console for `[EMAIL] Update notification sent...` (Task 2).**
 9. As customer, cancel → `DELETE /bookings/{id}`, and confirm `tickets_available` is restored.
 
 **RBAC checks:**
@@ -269,12 +314,13 @@ Coverage highlights:
   search/venue/availability filters, soft delete, ticket-count adjustment rules.
 - **Bookings** — book/list/cancel, inventory decrement & restore, overbooking,
   exact-availability, inactive-event, non-owner access, invalid quantity.
-- **Notifications** — both tasks log correctly; event-update notifies only customers with
-  confirmed bookings.
+- **Notifications** — both tasks send the right email to the right recipient (the SMTP
+  send is mocked in tests, so no real mail is sent); event-update notifies only customers
+  with confirmed bookings.
 
 ---
 
-## 9. Project Structure
+## 10. Project Structure
 
 ```
 app/

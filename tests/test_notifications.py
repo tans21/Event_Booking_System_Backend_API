@@ -16,7 +16,7 @@ LOGGER = "event_booking.notifications"
 # --- Task 1: booking confirmation -------------------------------------------
 
 
-async def test_booking_confirmation_logs_summary(caplog):
+async def test_booking_confirmation_sends_email(mock_email, caplog):
     with caplog.at_level(logging.INFO, logger=LOGGER):
         await send_booking_confirmation(
             booking_id=15,
@@ -25,16 +25,24 @@ async def test_booking_confirmation_logs_summary(caplog):
             quantity=2,
             total_price=Decimal("1998.00"),
         )
+    # a real email send was attempted, to the right person, with the right content
+    assert len(mock_email) == 1
+    email = mock_email[0]
+    assert email["to"] == "alice@example.com"
+    assert "Tech Summit 2026" in email["subject"]
+    assert "1998.00" in email["html"] and "Tech Summit 2026" in email["html"]
+
     messages = [r.getMessage() for r in caplog.records]
-    assert any("[EMAIL] Confirmation sent to alice@example.com" in m for m in messages)
-    assert any("Tech Summit 2026" in m and "1998.00" in m for m in messages)
+    assert any(
+        "Booking confirmation sent to alice@example.com" in m for m in messages
+    )
 
 
 # --- Task 2: event update notification --------------------------------------
 
 
 async def test_event_update_notifies_booked_customers(
-    client, organizer_headers, customer_headers, caplog
+    client, organizer_headers, customer_headers, mock_email, caplog
 ):
     event = await create_event(client, organizer_headers)
     await client.post(
@@ -42,6 +50,7 @@ async def test_event_update_notifies_booked_customers(
         json={"event_id": event["id"], "quantity": 1},
         headers=customer_headers,
     )
+    mock_email.clear()  # drop the booking-confirmation email from the count
 
     with caplog.at_level(logging.INFO, logger=LOGGER):
         await send_event_update_notifications(
@@ -51,15 +60,15 @@ async def test_event_update_notifies_booked_customers(
             session_factory=TestSessionLocal,
         )
 
-    messages = [r.getMessage() for r in caplog.records]
-    # the customer who booked is notified, with the list of changed fields
-    assert any(
-        "cust@example.com" in m and "venue, event_datetime" in m for m in messages
-    )
+    # the customer who booked is emailed, with the list of changed fields
+    assert len(mock_email) == 1
+    email = mock_email[0]
+    assert email["to"] == "cust@example.com"
+    assert "venue, event_datetime" in email["html"]
 
 
 async def test_event_update_only_notifies_confirmed_bookings(
-    client, organizer_headers, customer_headers, caplog
+    client, organizer_headers, customer_headers, mock_email, caplog
 ):
     event = await create_event(client, organizer_headers)
     r = await client.post(
@@ -71,6 +80,7 @@ async def test_event_update_only_notifies_confirmed_bookings(
     await client.delete(
         f"/api/v1/bookings/{r.json()['id']}", headers=customer_headers
     )
+    mock_email.clear()
 
     with caplog.at_level(logging.INFO, logger=LOGGER):
         await send_event_update_notifications(
@@ -80,9 +90,9 @@ async def test_event_update_only_notifies_confirmed_bookings(
             session_factory=TestSessionLocal,
         )
 
+    # nobody with a confirmed booking -> no email sent
+    assert mock_email == []
     messages = [r.getMessage() for r in caplog.records]
-    assert not any("notification sent to cust@example.com" in m for m in messages)
-    # and it reports that there was no one to notify
     assert any("no customers with active bookings" in m.lower() for m in messages)
 
 

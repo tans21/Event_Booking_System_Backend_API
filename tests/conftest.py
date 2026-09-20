@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -16,6 +17,7 @@ from sqlalchemy.pool import NullPool
 
 import app.models  # noqa: F401  ensure all models register on Base.metadata
 import app.routers.organizer as organizer_router
+import app.tasks.notifications as notifications
 from app.config import settings
 from app.database import Base
 from app.dependencies.db import get_db
@@ -57,6 +59,23 @@ async def _db_setup():
             text("TRUNCATE bookings, events, users RESTART IDENTITY CASCADE")
         )
     yield
+
+
+@pytest.fixture(autouse=True)
+def mock_email(monkeypatch):
+    """Intercept SMTP sends so tests never hit the network or send real mail.
+
+    Also disables EMAIL_TO_OVERRIDE so tests can assert the *correct* customer
+    is targeted (the override is only an optional demo redirect).
+    """
+    sent: list[dict] = []
+
+    async def _fake_send_email(*, to, subject, html):
+        sent.append({"to": to, "subject": subject, "html": html})
+
+    monkeypatch.setattr(notifications, "_send_email", _fake_send_email)
+    monkeypatch.setattr(settings, "EMAIL_TO_OVERRIDE", "")
+    return sent
 
 
 async def _override_get_db():
